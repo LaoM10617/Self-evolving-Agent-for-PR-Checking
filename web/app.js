@@ -155,20 +155,19 @@ function renderLlmRuntime(llm = {}, runMode = {}) {
     ? "暂时无法读取模型配置"
     : enabled
       ? `${provider} / ${model || "默认模型"}，参与上下文审查与风险判断`
-      : "未配置模型；仅运行确定性 Tool/Scanner 与 Gate，不会发生 Agent 讨论";
+      : "未配置模型；agentic 审查暂不可用";
   const state = failed ? "读取失败" : enabled ? "已启用" : "待配置";
   const runtime = failed
     ? "运行时状态未知"
     : enabled
       ? `${provider} / ${model || "模型已配置"}`
-      : "rules-only / 0 次模型调用";
+      : "agentic / 需要模型配置";
 
-  const effective = String(runMode.effective || (enabled ? "hybrid" : "rules-only"));
   const chain = $("#execution-chain");
   if (chain) {
     const scanner = '<div class="agent-step"><b>01</b><span><strong>Tool / Scanner</strong><small>规则、AST 与代码搜索提供事实</small></span><em>事实</em></div>';
     const gate = '<i class="flow-line"></i><div class="agent-step"><b>03</b><span><strong>Gate</strong><small>格式、证据、置信度与发布门禁</small></span><em class="done">门禁</em></div>';
-    const llmStep = effective === "rules-only" ? "" : `<i class="flow-line"></i><div class="agent-step is-active" id="llm-agent-step"><b>02</b><span><strong>${effective === "agentic" ? "4-role LLM Agents" : "Single LLM Agent"}</strong><small id="llm-agent-detail">${escapeHtml(detail)}</small></span><em id="llm-agent-state">${escapeHtml(state)}</em></div>`;
+    const llmStep = `<i class="flow-line"></i><div class="agent-step is-active" id="llm-agent-step"><b>02</b><span><strong>4-role LLM Agents</strong><small id="llm-agent-detail">${escapeHtml(detail)}</small></span><em id="llm-agent-state">${escapeHtml(state)}</em></div>`;
     chain.innerHTML = scanner + llmStep + gate;
   }
 
@@ -201,10 +200,8 @@ async function loadDashboard() {
     renderLlmRuntime(data.llm, data.run_mode);
     const modeSelect = $("#review-mode");
     if (modeSelect) {
-      modeSelect.value = data.run_mode?.effective || (data.llm?.enabled ? "hybrid" : "rules-only");
-      $$('option[value="hybrid"], option[value="agentic"]', modeSelect).forEach((option) => {
-        option.disabled = !data.llm?.enabled;
-      });
+      modeSelect.value = "agentic";
+      modeSelect.disabled = !data.llm?.enabled;
     }
     $("#system-status").textContent = `${data.queue} · ${data.orchestrator}`;
     const stats = data.stats || {};

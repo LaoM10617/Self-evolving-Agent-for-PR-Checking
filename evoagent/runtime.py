@@ -1,21 +1,17 @@
-"""EvoAgent's dependency-free durable runtime and bounded agent loop.
+"""EvoAgent's dependency-free durable workflow runtime and tool registry.
 
 The runtime deliberately separates orchestration from agent behaviour:
 
 * ``AgentRuntime`` executes named nodes with budgets, retry policy, cancellation
   checks and application-owned checkpoints.
-* ``AgentLoop`` executes model-selected tool actions until the agent returns a
-  final result or its step/time budget is exhausted.
-
-Both components are deterministic around side effects.  Persistence remains in
-the application store so a worker restart does not depend on a framework-owned
-checkpoint format.
+Tool-using model loops live in ``agentic_core.BoundedRole``. Persistence remains
+in the application store so a worker restart does not depend on a
+framework-owned checkpoint format.
 """
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-import json
 import time
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 class RuntimeBudgetExceeded(RuntimeError):
@@ -26,8 +22,8 @@ class RuntimeCancelled(RuntimeError):
     """The owning task requested cancellation."""
 
 
-class AgentLoopProtocolError(RuntimeError):
-    """An agent returned an invalid loop action."""
+class ToolProtocolError(RuntimeError):
+    """A tool request does not match the registered tool contract."""
 
 
 @dataclass(frozen=True)
@@ -66,25 +62,25 @@ class ToolRegistry:
     def invoke(self, name: str, arguments: Dict[str, Any]) -> Any:
         tool = self._tools.get(name)
         if tool is None:
-            raise AgentLoopProtocolError("unknown agent tool: %s" % name)
+            raise ToolProtocolError("unknown agent tool: %s" % name)
         self._validate(tool.parameters, arguments)
         return tool.handler(**arguments)
 
     @staticmethod
     def _validate(schema: Dict[str, Any], arguments: Dict[str, Any]) -> None:
         if not isinstance(arguments, dict):
-            raise AgentLoopProtocolError("tool arguments must be an object")
+            raise ToolProtocolError("tool arguments must be an object")
         properties = dict(schema.get("properties") or {})
         required = set(schema.get("required") or [])
         missing = required.difference(arguments)
         if missing:
-            raise AgentLoopProtocolError(
+            raise ToolProtocolError(
                 "missing required tool arguments: %s" % ", ".join(sorted(missing))
             )
         if schema.get("additionalProperties", False) is False:
             unknown = set(arguments).difference(properties)
             if unknown:
-                raise AgentLoopProtocolError(
+                raise ToolProtocolError(
                     "unknown tool arguments: %s" % ", ".join(sorted(unknown))
                 )
         expected_types = {
@@ -97,14 +93,14 @@ class ToolRegistry:
             if expected and (not isinstance(value, expected) or (
                 spec.get("type") in {"integer", "number"} and isinstance(value, bool)
             )):
-                raise AgentLoopProtocolError(
+                raise ToolProtocolError(
                     "tool argument %s must be %s" % (key, spec.get("type"))
                 )
             if isinstance(value, (int, float)):
                 if "minimum" in spec and value < spec["minimum"]:
-                    raise AgentLoopProtocolError("tool argument %s is below minimum" % key)
+                    raise ToolProtocolError("tool argument %s is below minimum" % key)
                 if "maximum" in spec and value > spec["maximum"]:
-                    raise AgentLoopProtocolError("tool argument %s exceeds maximum" % key)
+                    raise ToolProtocolError("tool argument %s exceeds maximum" % key)
 
 
 @dataclass(frozen=True)
@@ -221,88 +217,3 @@ class AgentRuntime:
             if last_error is not None:
                 raise last_error
         return state
-
-
-@dataclass
-class AgentLoopResult:
-    output: Any
-    steps: int
-    observations: List[Dict[str, Any]]
-    stop_reason: str
-
-
-class AgentLoop:
-    """Run a model/tool loop with strict action, time and observation budgets."""
-
-    def __init__(
-        self, max_steps: int = 4, timeout_seconds: int = 45,
-        max_observation_chars: int = 4000,
-    ):
-        if max_steps < 1:
-            raise ValueError("agent loop max_steps must be at least 1")
-        if timeout_seconds < 1:
-            raise ValueError("agent loop timeout_seconds must be at least 1")
-        self.max_steps = max_steps
-        self.timeout_seconds = timeout_seconds
-        self.max_observation_chars = max(256, max_observation_chars)
-
-    def run(
-        self, stepper: Callable[[Dict[str, Any]], Dict[str, Any]],
-        tools: Any, initial_state: Dict[str, Any],
-        event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    ) -> AgentLoopResult:
-        state = dict(initial_state)
-        observations = list(state.get("observations") or [])
-        started = time.monotonic()
-
-        def emit(kind: str, **detail) -> None:
-            if event_sink:
-                event_sink(kind, detail)
-
-        for step in range(1, self.max_steps + 1):
-            if time.monotonic() - started > self.timeout_seconds:
-                emit("agent_loop_budget_exhausted", step=step, budget="time")
-                raise RuntimeBudgetExceeded("agent loop time budget exceeded")
-            state["loop_step"] = step
-            state["observations"] = list(observations)
-            action = stepper(state)
-            if not isinstance(action, dict):
-                raise AgentLoopProtocolError("agent loop action must be an object")
-            kind = str(action.get("action", "")).strip().lower()
-            emit("agent_loop_action", step=step, action=kind)
-            if kind == "final":
-                return AgentLoopResult(
-                    action.get("findings", action.get("output")), step,
-                    observations, "final",
-                )
-            if kind != "tool":
-                raise AgentLoopProtocolError("unsupported agent loop action: %s" % kind)
-            tool_name = str(action.get("tool", "")).strip()
-            arguments = action.get("arguments") or {}
-            if not isinstance(arguments, dict):
-                raise AgentLoopProtocolError("tool arguments must be an object")
-            try:
-                if isinstance(tools, ToolRegistry):
-                    value = tools.invoke(tool_name, arguments)
-                else:
-                    tool = tools.get(tool_name)
-                    if tool is None:
-                        raise AgentLoopProtocolError("unknown agent tool: %s" % tool_name)
-                    value = tool(**arguments)
-                rendered = (
-                    json.dumps(value, ensure_ascii=False, sort_keys=True)
-                    if isinstance(value, (dict, list, tuple)) else str(value)
-                )
-                observation = {
-                    "step": step, "tool": tool_name, "ok": True,
-                    "result": rendered[:self.max_observation_chars],
-                }
-            except Exception as exc:
-                observation = {
-                    "step": step, "tool": tool_name, "ok": False,
-                    "error": str(exc)[:1000],
-                }
-            observations.append(observation)
-            emit("agent_loop_observation", **observation)
-        emit("agent_loop_budget_exhausted", step=self.max_steps, budget="steps")
-        raise RuntimeBudgetExceeded("agent loop step budget exceeded")

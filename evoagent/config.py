@@ -80,13 +80,6 @@ class Settings:
     database_url: str = ""
     redis_url: str = ""
     async_workers: int = 2
-    agent_max_workers: int = 4
-    agent_retries: int = 1
-    collaboration_rounds: int = 2
-    agent_loop_max_steps: int = 4
-    agent_loop_timeout_seconds: int = 45
-    context_max_tokens: int = 12000
-    context_reserved_tokens: int = 2500
     memory_enabled: bool = True
     memory_recall_limit: int = 6
     memory_working_ttl_seconds: int = 86400
@@ -114,11 +107,6 @@ class Settings:
     webhook_max_age_seconds: int = 600
     queue_max_attempts: int = 3
     queue_lease_seconds: int = 60
-    skill_timeout_seconds: int = 30
-    skill_memory_mb: int = 256
-    skill_sandbox: bool = True
-    skill_signing_key: str = ""
-    skill_container_image: str = ""
     repair_test_command: str = ""
     repair_verify_timeout_seconds: int = 120
     otel_endpoint: str = ""
@@ -130,10 +118,15 @@ class Settings:
     alert_smtp_host: str = ""
     alert_email_to: str = ""
     continuous_eval_seconds: int = 0
-    default_run_mode: str = ""
     agent_token_budget: int = 8000
     agent_time_budget_seconds: int = 60
-    enabled_agents: str = "planner,security,correctness-reliability,critic"
+    agent_context_window_tokens: int = 32768
+    agent_context_input_tokens: int = 20000
+    context_diff_token_budget: int = 12000
+    context_observation_token_budget: int = 4000
+    context_recent_observations: int = 2
+    context_map_chunk_tokens: int = 3000
+    enabled_agents: str = "lead,security,correctness-reliability,critic"
     llm_input_cost_per_million: float = 0.0
     llm_output_cost_per_million: float = 0.0
     evaluation_min_public_prs: int = 300
@@ -227,22 +220,6 @@ class Settings:
             raise ValueError("bootstrap admin username and password must be configured together")
         if not 0.0 <= self.alert_failure_rate <= 1.0:
             raise ValueError("EVOAGENT_ALERT_FAILURE_RATE must be between 0 and 1")
-        if self.agent_max_workers < 1:
-            raise ValueError("EVOAGENT_AGENT_MAX_WORKERS must be at least 1")
-        if self.agent_retries < 0:
-            raise ValueError("EVOAGENT_AGENT_RETRIES cannot be negative")
-        if self.collaboration_rounds < 1:
-            raise ValueError("EVOAGENT_COLLABORATION_ROUNDS must be at least 1")
-        if self.agent_loop_max_steps < 1:
-            raise ValueError("EVOAGENT_AGENT_LOOP_MAX_STEPS must be at least 1")
-        if self.context_max_tokens < 512:
-            raise ValueError("EVOAGENT_CONTEXT_MAX_TOKENS must be at least 512")
-        if not 0 <= self.context_reserved_tokens < self.context_max_tokens:
-            raise ValueError(
-                "EVOAGENT_CONTEXT_RESERVED_TOKENS must be smaller than the context budget"
-            )
-        if self.default_run_mode not in {"", "rules-only", "hybrid", "agentic"}:
-            raise ValueError("EVOAGENT_DEFAULT_RUN_MODE must be rules-only, hybrid or agentic")
         if self.llm_input_cost_per_million < 0 or self.llm_output_cost_per_million < 0:
             raise ValueError("LLM token prices cannot be negative")
         if self.evaluation_min_public_prs < 300:
@@ -266,15 +243,6 @@ class Settings:
             database_url=os.getenv("EVOAGENT_DATABASE_URL", ""),
             redis_url=os.getenv("EVOAGENT_REDIS_URL", ""),
             async_workers=_int("EVOAGENT_ASYNC_WORKERS", 2),
-            agent_max_workers=_int("EVOAGENT_AGENT_MAX_WORKERS", 4),
-            agent_retries=_non_negative_int("EVOAGENT_AGENT_RETRIES", 1),
-            collaboration_rounds=_int("EVOAGENT_COLLABORATION_ROUNDS", 2),
-            agent_loop_max_steps=_int("EVOAGENT_AGENT_LOOP_MAX_STEPS", 4),
-            agent_loop_timeout_seconds=_int("EVOAGENT_AGENT_LOOP_TIMEOUT_SECONDS", 45),
-            context_max_tokens=_int("EVOAGENT_CONTEXT_MAX_TOKENS", 12000),
-            context_reserved_tokens=_non_negative_int(
-                "EVOAGENT_CONTEXT_RESERVED_TOKENS", 2500
-            ),
             memory_enabled=_bool("EVOAGENT_MEMORY_ENABLED", True),
             memory_recall_limit=_int("EVOAGENT_MEMORY_RECALL_LIMIT", 6),
             memory_working_ttl_seconds=_int(
@@ -306,11 +274,6 @@ class Settings:
             webhook_max_age_seconds=_int("EVOAGENT_WEBHOOK_MAX_AGE_SECONDS", 600),
             queue_max_attempts=_int("EVOAGENT_QUEUE_MAX_ATTEMPTS", 3),
             queue_lease_seconds=_int("EVOAGENT_QUEUE_LEASE_SECONDS", 60),
-            skill_timeout_seconds=_int("EVOAGENT_SKILL_TIMEOUT_SECONDS", 30),
-            skill_memory_mb=_int("EVOAGENT_SKILL_MEMORY_MB", 256),
-            skill_sandbox=_bool("EVOAGENT_SKILL_SANDBOX", True),
-            skill_signing_key=os.getenv("EVOAGENT_SKILL_SIGNING_KEY", ""),
-            skill_container_image=os.getenv("EVOAGENT_SKILL_CONTAINER_IMAGE", ""),
             repair_test_command=os.getenv("EVOAGENT_REPAIR_TEST_COMMAND", ""),
             repair_verify_timeout_seconds=_int("EVOAGENT_REPAIR_VERIFY_TIMEOUT_SECONDS", 120),
             otel_endpoint=os.getenv("EVOAGENT_OTEL_ENDPOINT", ""),
@@ -324,12 +287,29 @@ class Settings:
             continuous_eval_seconds=_non_negative_int(
                 "EVOAGENT_CONTINUOUS_EVAL_SECONDS", 0
             ),
-            default_run_mode=os.getenv("EVOAGENT_DEFAULT_RUN_MODE", "").strip().lower(),
             agent_token_budget=_int("EVOAGENT_AGENT_TOKEN_BUDGET", 8000),
             agent_time_budget_seconds=_int("EVOAGENT_AGENT_TIME_BUDGET_SECONDS", 60),
+            agent_context_window_tokens=_int(
+                "EVOAGENT_AGENT_CONTEXT_WINDOW_TOKENS", 32768
+            ),
+            agent_context_input_tokens=_int(
+                "EVOAGENT_AGENT_CONTEXT_INPUT_TOKENS", 20000
+            ),
+            context_diff_token_budget=_int(
+                "EVOAGENT_CONTEXT_DIFF_TOKEN_BUDGET", 12000
+            ),
+            context_observation_token_budget=_int(
+                "EVOAGENT_CONTEXT_OBSERVATION_TOKEN_BUDGET", 4000
+            ),
+            context_recent_observations=_non_negative_int(
+                "EVOAGENT_CONTEXT_RECENT_OBSERVATIONS", 2
+            ),
+            context_map_chunk_tokens=_int(
+                "EVOAGENT_CONTEXT_MAP_CHUNK_TOKENS", 3000
+            ),
             enabled_agents=os.getenv(
                 "EVOAGENT_ENABLED_AGENTS",
-                "planner,security,correctness-reliability,critic",
+                "lead,security,correctness-reliability,critic",
             ),
             llm_input_cost_per_million=float(
                 os.getenv("EVOAGENT_LLM_INPUT_COST_PER_MILLION", "0")

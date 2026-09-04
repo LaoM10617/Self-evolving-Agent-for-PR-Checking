@@ -129,7 +129,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             mode = resolve_mode(
-                self.settings.default_run_mode or None, bool(self.service.llm_config)
+                None, bool(self.service.llm_config)
             )
             self._send_json(200, {"status": "ok", "reviewer": self.service.reviewer.name,
                                   "runtime": self.service.harness.name,
@@ -147,7 +147,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/dashboard":
             mode = resolve_mode(
-                self.settings.default_run_mode or None, bool(self.service.llm_config)
+                None, bool(self.service.llm_config)
             )
             self._send_json(200, {"stats": self.service.store.dashboard_stats(principal.tenant_id),
                                   "tasks": self.service.store.list_tasks(10, principal.tenant_id),
@@ -337,11 +337,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                     or not all(isinstance(item, str) for item in enabled_agents)
                 ):
                     raise ValueError("enabled_agents must be an array of role names")
+                enabled_skills = payload.get("enabled_skills")
+                if enabled_skills is not None and (
+                    not isinstance(enabled_skills, list)
+                    or not all(isinstance(item, str) for item in enabled_skills)
+                ):
+                    raise ValueError("enabled_skills must be an array of Agent Skill names")
                 options = {
                     "tenant_id": principal.tenant_id,
                     "mode": str(payload.get("mode", "")),
                     "repository_root": str(payload.get("repository_root", "")),
                     "enabled_agents": enabled_agents,
+                    "enabled_skills": enabled_skills,
                 }
                 if query.get("async", ["false"])[0].lower() == "true":
                     result = self.service.enqueue_review(*args, **options)
@@ -510,8 +517,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/v1/skill-evolution/propose":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
+                artifact = payload.get("artifact")
+                if artifact is None and "skill_md" in payload:
+                    artifact = {
+                        "name": str(payload.get("skill_name", "")),
+                        "skill_md": payload.get("skill_md"),
+                        "supporting_files": payload.get("supporting_files") or {},
+                    }
                 result = self.service.skill_evolution.propose(
-                    str(payload.get("skill_name", "")), payload.get("artifact"),
+                    str(payload.get("skill_name", "")), artifact,
                     principal.tenant_id,
                 )
                 if result["decision"] == "activated":

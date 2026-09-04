@@ -9,6 +9,7 @@ from evoagent.fixer import SafeFixer
 from evoagent.models import Finding, Severity
 from evoagent.service import ReviewService
 from evoagent.store import TaskStore
+from agentic_fake import enable_agentic_service
 
 
 def settings(path):
@@ -269,7 +270,7 @@ class AdvancedFeatureTests(unittest.TestCase):
             )
 
     def test_async_multi_agent_review(self):
-        service = ReviewService(settings(self.path))
+        service = enable_agentic_service(ReviewService(settings(self.path)))
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n-old\n+eval(data)\n+# TODO finish validation\n"
         result = service.enqueue_review("org/repo", diff, 2)
         task = None

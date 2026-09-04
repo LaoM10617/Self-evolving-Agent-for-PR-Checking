@@ -38,6 +38,17 @@ def to_markdown(report: Dict[str, Any]) -> str:
         ])
         if run_mode.get("fallback_reason"):
             lines.extend(["> %s" % run_mode["fallback_reason"], ""])
+        context = execution.get("context_management") or {}
+        if context:
+            memory = context.get("memory_recall") or {}
+            lines[-1:-1] = [
+                "- Context compression: `%s` view(s), estimated reduction `%.1f%%`; "
+                "recalled memories `%s`" % (
+                    context.get("compression_calls", 0),
+                    max(0.0, float(context.get("estimated_reduction_ratio", 0) or 0) * 100),
+                    memory.get("recalled", 0),
+                )
+            ]
     collaboration = report.get("collaboration") or {}
     if collaboration and run_mode.get("effective") == "agentic" and execution.get("llm_calls", 0):
         lines.extend([

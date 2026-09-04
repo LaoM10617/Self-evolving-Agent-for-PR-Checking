@@ -1,4 +1,4 @@
-"""Truthful execution modes and product component taxonomy."""
+"""Agentic execution mode and product component taxonomy."""
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
@@ -7,19 +7,17 @@ from .models import ComponentKind
 
 
 class RunMode(str, Enum):
-    RULES_ONLY = "rules-only"
-    HYBRID = "hybrid"
     AGENTIC = "agentic"
 
     @classmethod
     def parse(cls, value: Optional[str], default: "RunMode" = None) -> "RunMode":
-        fallback = default or cls.RULES_ONLY
+        fallback = default or cls.AGENTIC
         if value is None or not str(value).strip():
             return fallback
         try:
             return cls(str(value).strip().lower())
         except ValueError as exc:
-            raise ValueError("mode must be rules-only, hybrid or agentic") from exc
+            raise ValueError("mode must be agentic") from exc
 
 
 @dataclass(frozen=True)
@@ -39,15 +37,9 @@ class ModeResolution:
 
 
 def resolve_mode(requested: Optional[str], model_configured: bool) -> ModeResolution:
-    # The safe default is deliberately derived from actual capabilities.
-    default = RunMode.HYBRID if model_configured else RunMode.RULES_ONLY
-    selected = RunMode.parse(requested, default)
-    if selected is not RunMode.RULES_ONLY and not model_configured:
-        return ModeResolution(
-            selected, RunMode.RULES_ONLY, False,
-            "No model is configured; the request ran as rules-only.",
-        )
-    return ModeResolution(selected, selected, model_configured)
+    selected = RunMode.parse(requested, RunMode.AGENTIC)
+    unavailable = "" if model_configured else "Agentic review requires a configured model."
+    return ModeResolution(selected, selected, model_configured, unavailable)
 
 
 def component(kind: ComponentKind, name: str, enabled: bool = True, **detail) -> dict:
@@ -68,8 +60,9 @@ def public_taxonomy() -> Dict[str, Any]:
             ),
         },
         "run_modes": {
-            RunMode.RULES_ONLY.value: "Deterministic scanners and gates; no model calls.",
-            RunMode.HYBRID.value: "Deterministic scanners plus one LLM agent and gates.",
-            RunMode.AGENTIC.value: "Planner, two specialists and a blind critic are LLM agents.",
+            RunMode.AGENTIC.value: (
+                "A Lead delegates to Security and Correctness/Reliability workers, a blind "
+                "Critic verifies once, and the Lead performs final synthesis."
+            ),
         },
     }

@@ -65,7 +65,7 @@ class MemoryManager:
     def recall(
         self, tenant_id: str, repository: str, query: str,
         scopes: Sequence[str] = ("semantic", "episodic"),
-        limit: Optional[int] = None,
+        limit: Optional[int] = None, task_id: str = "",
     ) -> List[Dict[str, Any]]:
         if not self.enabled:
             return []
@@ -78,6 +78,10 @@ class MemoryManager:
         candidates = self.store.list_agent_memories(
             tenant_id or "default", repository, selected_scopes, 200
         )
+        if task_id:
+            candidates = [
+                item for item in candidates if str(item.get("task_id", "")) == str(task_id)
+            ]
         query_tokens = _tokens(query)
         ranked = []
         for index, item in enumerate(candidates):
@@ -100,6 +104,54 @@ class MemoryManager:
             ranked,
             key=lambda item: (-item["recall_score"], item.get("created_at", "")),
         )[:size]
+
+    def recall_working(
+        self, tenant_id: str, repository: str, task_id: str, query: str = "",
+        limit: Optional[int] = None, agent: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Recall only the transient observations belonging to one review task."""
+        if not task_id:
+            return []
+        values = self.recall(
+            tenant_id, repository, query, scopes=("working",),
+            # Filter by agent after the store query; request the bounded
+            # candidate set first so another role's higher-importance entries
+            # cannot hide this role's own observations.
+            limit=200 if agent else limit,
+            task_id=task_id,
+        )
+        selected = [
+            item for item in values
+            if not agent or str(item.get("agent", "")) == str(agent)
+        ]
+        return selected[:max(1, limit or self.recall_limit)]
+
+    def remember_observation(
+        self, tenant_id: str, repository: str, task_id: str, agent: str,
+        observation: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Store a bounded, factual tool observation for later roles in this task."""
+        result = observation.get("result")
+        evidence_id = result.get("evidence_id", "") if isinstance(result, dict) else ""
+        output = result.get("output") if isinstance(result, dict) else result
+        try:
+            rendered = json.dumps(output, ensure_ascii=False, default=str, separators=(",", ":"))
+        except (TypeError, ValueError):
+            rendered = str(output)
+        content = "Agent %s tool %s at step %s: %s. Evidence: %s. Output: %s" % (
+            agent, observation.get("tool", "unknown"), observation.get("step", 0),
+            "ok" if observation.get("ok") else "failed", evidence_id,
+            rendered[:4000] if observation.get("ok") else str(observation.get("error", ""))[:1000],
+        )
+        return self.remember(
+            tenant_id, repository, "working", "tool_observation", content,
+            {
+                "tool": str(observation.get("tool", "")),
+                "step": observation.get("step", 0), "ok": bool(observation.get("ok")),
+                "evidence_id": evidence_id,
+            }, task_id=task_id, agent=agent,
+            importance=0.5 if observation.get("ok") else 0.3,
+        )
 
     def remember_finding(
         self, tenant_id: str, repository: str, task_id: str,

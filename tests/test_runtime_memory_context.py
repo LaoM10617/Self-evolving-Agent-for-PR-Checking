@@ -1,18 +1,19 @@
 import os
 import tempfile
 import unittest
+import json
 
-from evoagent.agents import MultiAgentCoordinator
+from evoagent.agentic_core import BoundedRole
 from evoagent.context_manager import ContextManager
-from evoagent.diff_parser import parse_unified_diff
 from evoagent.memory import MemoryManager
-from evoagent.models import Finding, Severity
-from evoagent.reviewer import OpenAICompatibleReviewer
-from evoagent.runtime import AgentLoop, AgentRuntime, AgentTool, RuntimeNode, ToolRegistry
+from evoagent.runtime import (
+    AgentRuntime, AgentTool, RuntimeNode, ToolProtocolError, ToolRegistry,
+)
 from evoagent.store import TaskStore, utc_now
+from evoagent.telemetry import ExecutionLedger
 
 
-class RuntimeMemoryContextTests(unittest.TestCase):
+class RuntimeMemoryTests(unittest.TestCase):
     def setUp(self):
         handle, self.path = tempfile.mkstemp(suffix=".db")
         os.close(handle)
@@ -40,20 +41,6 @@ class RuntimeMemoryContextTests(unittest.TestCase):
         self.assertEqual(6, second["result"])
         self.assertEqual(["plan", "execute"], calls)
 
-    def test_agent_loop_executes_tool_then_returns_final_output(self):
-        def stepper(state):
-            if not state.get("observations"):
-                return {"action": "tool", "tool": "lookup", "arguments": {"key": "x"}}
-            return {"action": "final", "output": state["observations"][0]["result"]}
-
-        result = AgentLoop(max_steps=3, timeout_seconds=5).run(
-            stepper, {"lookup": lambda key: "value:%s" % key}, {}
-        )
-
-        self.assertEqual("value:x", result.output)
-        self.assertEqual(2, result.steps)
-        self.assertEqual("lookup", result.observations[0]["tool"])
-
     def test_tool_registry_validates_arguments_before_invocation(self):
         calls = []
         registry = ToolRegistry([AgentTool(
@@ -66,61 +53,12 @@ class RuntimeMemoryContextTests(unittest.TestCase):
             lambda key: calls.append(key) or "value:%s" % key,
         )])
 
-        def stepper(state):
-            if not state.get("observations"):
-                return {
-                    "action": "tool", "tool": "lookup",
-                    "arguments": {"key": 7, "unexpected": True},
-                }
-            return {"action": "final", "output": state["observations"][0]}
+        with self.assertRaisesRegex(ToolProtocolError, "unknown tool arguments"):
+            registry.invoke("lookup", {"key": 7, "unexpected": True})
 
-        result = AgentLoop(max_steps=2, timeout_seconds=5).run(stepper, registry, {})
-
-        self.assertFalse(result.output["ok"])
-        self.assertIn("unknown tool arguments", result.output["error"])
         self.assertEqual([], calls)
         self.assertEqual("value:x", registry.invoke("lookup", {"key": "x"}))
         self.assertEqual(["x"], calls)
-
-    def test_context_manager_compresses_large_diff_and_keeps_risk_evidence(self):
-        added = ["+value_%03d = %d\n" % (index, index) for index in range(300)]
-        added[250] = "+result = eval(user_input)\n"
-        diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1,300 @@\n" + "".join(added)
-
-        bundle = ContextManager(max_tokens=512, reserved_tokens=64).build(
-            diff, {"risk_domains": ["security"], "objective": "find injection"}
-        )
-
-        self.assertTrue(bundle.compressed)
-        self.assertLess(bundle.final_tokens, bundle.original_tokens)
-        self.assertIn("eval(user_input)", bundle.text)
-        self.assertEqual("risk-ranked-hunk-compression", bundle.strategy)
-
-    def test_context_window_bounds_feedback_memory_and_observations(self):
-        manager = ContextManager(max_tokens=512, reserved_tokens=128)
-        diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
-        bundle = manager.build(diff, {"objective": "review"})
-        feedback = ["feedback-%02d %s" % (i, "x" * 200) for i in range(12)]
-        memories = [{
-            "scope": "semantic", "kind": "review_feedback",
-            "content": "memory-%02d %s" % (i, "y" * 200),
-        } for i in range(12)]
-        observations = [{
-            "step": i, "tool": "search_diff", "ok": True,
-            "result": "observation-%02d %s" % (i, "z" * 200),
-        } for i in range(12)]
-
-        managed = manager.compose(
-            bundle, {"agent": "security", "objective": "review risky additions"},
-            feedback=feedback, memories=memories, observations=observations,
-            tools=[{"name": "search_diff", "description": "Search diff", "parameters": {}}],
-        )
-
-        self.assertLessEqual(managed.estimated_tokens, 512)
-        self.assertTrue(managed.compressed)
-        self.assertGreater(managed.dropped_observations, 0)
-        self.assertGreater(managed.dropped_feedback + managed.dropped_memories, 0)
-        self.assertIn("DIFF_CONTEXT", managed.text)
 
     def test_memory_recall_is_repository_and_tenant_isolated(self):
         memory = MemoryManager(self.store, recall_limit=5)
@@ -142,66 +80,6 @@ class RuntimeMemoryContextTests(unittest.TestCase):
         self.assertIn("SEC-EVAL", recalled[0]["content"])
         self.assertEqual([], memory.recall("tenant-a", "org/other", "SEC-EVAL"))
 
-    def test_coordinator_uses_agent_loop_context_and_memory(self):
-        diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
-        parsed = parse_unified_diff(diff)
-        self.store.create("loop-task", "org/repo", 7, {}, "tenant-a")
-        memory = MemoryManager(self.store)
-        memory.remember(
-            "tenant-a", "org/repo", "semantic", "review_feedback",
-            "Dynamic execution in app.py requires exact changed-line evidence",
-            importance=0.9,
-        )
-
-        class LoopSpecialist:
-            name = "loop-specialist"
-            domains = ("security",)
-
-            def review(self, _diff, _parsed):
-                return []
-
-            def agent_step(self, state):
-                if not state.get("observations"):
-                    return {
-                        "action": "tool", "tool": "changed_line",
-                        "arguments": {"path": "app.py", "line": 1},
-                    }
-                line = state["parsed"].added_lines[0]
-                return {"action": "final", "findings": [Finding(
-                    "SEC-EVAL", Severity.CRITICAL, "Dynamic execution",
-                    "The changed line executes data as code without a trust boundary.",
-                    line.path, line.line, line.content,
-                    "Replace eval with an explicit parser and allow-listed dispatch.",
-                    "Add a regression test proving input is handled as data.", 0.9,
-                )]}
-
-        coordinator = MultiAgentCoordinator(
-            [LoopSpecialist()], store=self.store, memory_manager=memory,
-            context_manager=ContextManager(max_tokens=1024, reserved_tokens=128),
-        )
-        findings = coordinator.review_with_context(
-            "loop-task", diff, parsed, repository="org/repo", tenant_id="tenant-a"
-        )
-        summary = coordinator.collaboration_summary("loop-task")
-        kinds = {item["kind"] for item in self.store.get("loop-task")["collaboration"]}
-
-        self.assertEqual({"SEC-EVAL"}, {item.rule_id for item in findings})
-        self.assertEqual(2, summary["agent_loop_steps"])
-        self.assertEqual(1, summary["memories_recalled"])
-        self.assertTrue({
-            "memory_recalled", "context_prepared", "agent_loop_action",
-            "agent_loop_observation",
-        }.issubset(kinds))
-        episodic = self.store.list_agent_memories(
-            "tenant-a", "org/repo", ("episodic",), 10
-        )
-        self.assertTrue(any(item["kind"] == "finding_approved" for item in episodic))
-        self.assertTrue(any(item["kind"] == "task_summary" for item in episodic))
-        working = self.store.list_agent_memories(
-            "tenant-a", "org/repo", ("working",), 10
-        )
-        self.assertEqual([], working)
-
     def test_memory_recall_purges_expired_records(self):
         self.store.save_agent_memory({
             "id": "expired-memory", "tenant_id": "tenant-a",
@@ -217,36 +95,87 @@ class RuntimeMemoryContextTests(unittest.TestCase):
             "tenant-a", "org/repo", ("working",), 10
         ))
 
-    def test_openai_reviewer_uses_runtime_tool_protocol(self):
-        diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
-        parsed = parse_unified_diff(diff)
+    def test_tool_observation_is_written_and_visible_to_next_agent_step(self):
+        memory = MemoryManager(self.store, recall_limit=8)
+        seen = []
 
-        class CannedReviewer(OpenAICompatibleReviewer):
-            def __init__(self):
-                super().__init__("https://example.invalid", "key", "model")
-                self.responses = [
-                    {
-                        "action": "tool", "tool": "changed_line",
-                        "arguments": {"path": "app.py", "line": 1},
-                    },
-                    {"action": "final", "findings": [{
-                        "rule_id": "SEC-EVAL", "severity": "critical",
-                        "title": "Dynamic execution",
-                        "explanation": "The changed line executes input as code without validation.",
-                        "path": "app.py", "line": 1, "evidence": "eval(data)",
-                        "fix": "Replace eval with an explicit allow-listed parser.",
-                        "test": "Add a regression test using an untrusted expression.",
-                        "confidence": 0.9,
-                    }]},
-                ]
+        class ToolThenFinalClient:
+            provider = "fake"
+            model = "fake"
 
-            def _request_json(self, _payload):
-                return self.responses.pop(0)
+            def complete_json(_self, _role, _prompt, user, ledger=None, max_tokens=None):
+                managed = json.loads(user)
+                task = json.loads(managed["task"])
+                seen.append(task.get("working_memory"))
+                if ledger:
+                    ledger.record_model("security", "fake", "fake", {
+                        "prompt_tokens": 10, "completion_tokens": 3,
+                    }, 1)
+                if len(seen) == 1:
+                    return {"action": "tool", "tool": "lookup", "arguments": {"key": "auth"}}
+                return {"action": "final", "findings": []}
 
-        coordinator = MultiAgentCoordinator([CannedReviewer()])
-        findings = coordinator.review(diff, parsed)
+        def supplier():
+            values = memory.recall_working("tenant-a", "org/repo", "task")
+            return ContextManager.format_memories(values) if values else None
 
-        self.assertEqual({"SEC-EVAL"}, {item.rule_id for item in findings})
+        def sink(agent, observation):
+            memory.remember_observation(
+                "tenant-a", "org/repo", "task", agent, observation,
+            )
+
+        role = BoundedRole(
+            "security", "Use facts.", ToolThenFinalClient(), 1000, 10,
+            context_manager=ContextManager(), working_memory_supplier=supplier,
+            observation_sink=sink,
+        )
+        registry = ToolRegistry([AgentTool(
+            "lookup", "Lookup a fact.", {
+                "type": "object", "properties": {"key": {"type": "string"}},
+                "required": ["key"], "additionalProperties": False,
+            }, lambda key: {"evidence_id": "lookup:%s" % key, "output": {"value": "allowed"}},
+        )])
+
+        role.run(json.dumps({"phase": "worker"}), registry, ExecutionLedger("agentic"))
+
+        self.assertIsNone(seen[0])
+        self.assertEqual("tool_observation", seen[1]["items"][0]["kind"])
+        self.assertIn("lookup:auth", seen[1]["items"][0]["content"])
+
+    def test_task_consolidation_releases_working_memory_but_keeps_episode(self):
+        memory = MemoryManager(self.store)
+        memory.remember_observation("tenant-a", "org/repo", "task", "security", {
+            "step": 1, "tool": "symbol", "ok": True,
+            "result": {"evidence_id": "symbol:auth", "output": {"callers": ["api"]}},
+        })
+
+        memory.consolidate_task("tenant-a", "org/repo", "task", {"accepted_findings": []})
+
+        self.assertEqual([], memory.recall_working("tenant-a", "org/repo", "task"))
+        archived = memory.recall("tenant-a", "org/repo", "completed task")
+        self.assertEqual("task_summary", archived[0]["kind"])
+
+    def test_working_memory_is_isolated_by_agent_role(self):
+        memory = MemoryManager(self.store)
+        memory.remember_observation("tenant-a", "org/repo", "task", "security", {
+            "step": 1, "tool": "lookup", "ok": True,
+            "result": {"evidence_id": "security:auth", "output": "security fact"},
+        })
+        memory.remember_observation("tenant-a", "org/repo", "task", "correctness-reliability", {
+            "step": 1, "tool": "lookup", "ok": True,
+            "result": {"evidence_id": "correctness:auth", "output": "correctness fact"},
+        })
+
+        security = memory.recall_working(
+            "tenant-a", "org/repo", "task", agent="security",
+        )
+        critic = memory.recall_working(
+            "tenant-a", "org/repo", "task", agent="critic",
+        )
+
+        self.assertEqual(1, len(security))
+        self.assertIn("security:auth", security[0]["content"])
+        self.assertEqual([], critic)
 
 
 if __name__ == "__main__":

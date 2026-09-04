@@ -1,14 +1,14 @@
+import json
 import os
 import tempfile
 import unittest
 
-from evoagent.agentic_core import ModeRouterReviewer
+from evoagent.agentic_core import AgenticReviewer
 from evoagent.config import Settings
 from evoagent.diff_parser import parse_unified_diff
 from evoagent.evaluation_v2 import validate_real_dataset
 from evoagent.evolution_v2 import RootCauseEvolutionGenerator
 from evoagent.patching import apply_file_patch, parse_unified_patch
-from evoagent.report import to_markdown
 from evoagent.service import ReviewService
 from evoagent.store import TaskStore
 from evoagent.verifier import RepairVerifier
@@ -27,14 +27,37 @@ class FakeChatClient:
                 role, self.provider, self.model,
                 {"prompt_tokens": 10, "completion_tokens": 5}, 1,
             )
-        if role == "planner":
-            return {
-                "action": "final", "task_graph": [
-                    {"specialist": "security", "objective": "Trace user input", "files": ["app.py"]},
-                    {"specialist": "correctness-reliability", "objective": "Check failures", "files": ["app.py"]},
-                ],
-                "languages": ["python"], "risk_level": "high",
-            }
+        if role == "lead":
+            managed = json.loads(user)
+            task = json.loads(managed["task"])
+            if task["phase"] == "delegate":
+                return {
+                    "action": "final", "delegations": [
+                        {
+                            "assignment_id": "security-1", "worker": "security",
+                            "objective": "Trace user input", "files": ["app.py"],
+                        },
+                        {
+                            "assignment_id": "reliability-1",
+                            "worker": "correctness-reliability",
+                            "objective": "Check failures", "files": ["app.py"],
+                        },
+                    ], "risk_level": "high",
+                }
+            if task["phase"] == "assess-workers":
+                return {
+                    "action": "final", "revision_requests": [],
+                    "critic_objective": "Challenge every candidate.",
+                }
+            if task["phase"] == "finalize":
+                return {
+                    "action": "final",
+                    "accepted_finding_indices": list(
+                        range(len(task["candidate_findings"]))
+                    ),
+                    "confidence_adjustments": [],
+                }
+            raise AssertionError(task["phase"])
         if role == "security":
             return {
                 "action": "final", "findings": [{
@@ -58,7 +81,7 @@ class FakeChatClient:
                 "clusters": [{"name": "weak evidence", "failure_case_ids": [1], "root_cause": "No call chain"}],
                 "candidate": {
                     "prompt_additions": ["Require a call chain for high-risk claims."],
-                    "few_shot_examples": [], "planner_routing_rules": [],
+                    "few_shot_examples": [], "lead_delegation_rules": [],
                     "tool_selection_policy": [], "budget_parameters": {"critic": 2000},
                 },
                 "rationale": "Improve evidence quality.",
@@ -85,31 +108,29 @@ class PhaseImplementationTests(unittest.TestCase):
             auto_post_review=False,
         )
 
-    def test_no_model_downgrades_without_agent_discussion(self):
+    def test_agentic_mode_rejects_missing_model_configuration(self):
         service = ReviewService(self.settings())
-        result = service.create_review("org/repo", DIFF, mode="agentic")
-        service.queue.close()
-        report = result["report"]
-        self.assertEqual("agentic", report["run_mode"]["requested"])
-        self.assertEqual("rules-only", report["run_mode"]["effective"])
-        self.assertEqual({}, report["collaboration"])
-        self.assertEqual(0, report["execution"]["llm_calls"])
-        self.assertNotIn("collaboration", to_markdown(report).lower())
+        try:
+            with self.assertRaisesRegex(RuntimeError, "requires a configured model"):
+                service.create_review("org/repo", DIFF, mode="agentic")
+        finally:
+            service.queue.close()
 
     def test_agentic_mode_runs_exact_four_real_roles(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {
             "mode": "agentic",
-            "enabled_agents": ["planner", "security", "correctness-reliability", "critic"],
+            "enabled_agents": ["lead", "security", "correctness-reliability", "critic"],
         })
-        reviewer = ModeRouterReviewer(store, FakeChatClient())
+        reviewer = AgenticReviewer(store, FakeChatClient())
         parsed = parse_unified_diff(DIFF)
         findings = reviewer.review_with_context("task", DIFF, parsed, "org/repo")
         summary = reviewer.collaboration_summary("task")
         self.assertEqual(["SEC-EVAL"], [item.rule_id for item in findings])
-        self.assertEqual(4, summary["execution"]["llm_calls"])
+        self.assertEqual(6, summary["execution"]["llm_calls"])
+        self.assertEqual("high", summary["collaboration"]["risk_level"])
         self.assertEqual(
-            ["planner", "security", "correctness-reliability", "critic"],
+            ["lead", "security", "correctness-reliability", "critic"],
             summary["collaboration"]["roles"],
         )
         for role in summary["collaboration"]["roles"]:

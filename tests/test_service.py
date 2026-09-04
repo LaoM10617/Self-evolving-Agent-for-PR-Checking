@@ -4,6 +4,7 @@ import unittest
 
 from evoagent.config import Settings
 from evoagent.service import ReviewService
+from agentic_fake import enable_agentic_service
 
 
 class ServiceTests(unittest.TestCase):
@@ -21,26 +22,38 @@ class ServiceTests(unittest.TestCase):
 
     def test_end_to_end_review(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
-        service = ReviewService(self.settings)
+        service = enable_agentic_service(ReviewService(self.settings))
         result = service.create_review("org/repo", diff, 1)
         task = service.store.get(result["task_id"])
         service.queue.close()
         self.assertEqual("SUCCESS", result["state"])
         self.assertEqual("SEC-EVAL", result["report"]["findings"][0]["rule_id"])
-        self.assertEqual("rules-only", result["report"]["run_mode"]["effective"])
-        self.assertEqual({}, result["report"]["collaboration"])
-        self.assertEqual(0, result["report"]["execution"]["llm_calls"])
+        self.assertEqual("agentic", result["report"]["run_mode"]["effective"])
+        self.assertEqual(
+            ["lead", "security", "correctness-reliability", "critic"],
+            result["report"]["collaboration"]["roles"],
+        )
+        self.assertEqual(5, result["report"]["execution"]["llm_calls"])
+        self.assertEqual("normal", result["report"]["collaboration"]["risk_level"])
+        role_calls = {}
+        for call in result["report"]["execution"]["model_call_log"]:
+            role_calls[call["role"]] = role_calls.get(call["role"], 0) + 1
+        self.assertEqual({
+            "lead": 2, "security": 1,
+            "correctness-reliability": 1, "critic": 1,
+        }, role_calls)
+        self.assertEqual(0, result["report"]["collaboration"]["revision_rounds"])
         self.assertGreater(result["report"]["execution"]["tool_calls"], 0)
         self.assertEqual([], task["collaboration"])
 
     def test_rejects_large_diff(self):
-        service = ReviewService(self.settings)
+        service = enable_agentic_service(ReviewService(self.settings))
         with self.assertRaises(ValueError):
             service.create_review("org/repo", "x" * 10001)
 
     def test_completed_review_feedback_is_persisted_and_listed_per_task(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
-        service = ReviewService(self.settings)
+        service = enable_agentic_service(ReviewService(self.settings))
         result = service.create_review("org/repo", diff, 1)
         task_id = result["task_id"]
 

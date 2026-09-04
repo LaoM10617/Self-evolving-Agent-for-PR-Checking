@@ -1,26 +1,20 @@
-"""Versioned, replay-gated evolution for executable review skills.
-
-The evolved artifact is deliberately declarative.  Feedback may change matching
-behaviour, but it cannot inject Python or acquire host permissions.  Every
-candidate is replayed against validation and holdout datasets before activation.
-"""
+"""Replay-gated evolution of standard Agent Skill ``SKILL.md`` packages."""
 import hashlib
 import json
 import re
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .diff_parser import parse_unified_diff
 from .evolution import RegressionEvaluator
-from .models import Finding, Severity
 from .reviewer import Reviewer
+from .skills import AgentSkill, SKILL_NAME
 from .store import utc_now
 
 
-ARTIFACT_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 2
 RULE_ID = re.compile(r"[A-Z][A-Z0-9_-]{1,79}")
-SKILL_NAME = re.compile(r"evolved-[a-z0-9][a-z0-9_-]{0,72}")
 
 
 def _canonical_json(value: dict) -> str:
@@ -31,104 +25,141 @@ def _sha256(value: dict) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def validate_artifact(artifact: dict, expected_name: str = "") -> dict:
-    """Validate and normalize an untrusted declarative skill artifact."""
+def _default_skill_markdown(name: str) -> str:
+    return """---
+name: %s
+description: Apply replay-validated review guidance learned from confirmed feedback. Use during code review when project-specific failure patterns may apply.
+---
+
+# Review project-specific failure patterns
+
+Inspect the current change using repository evidence. Report only actionable defects introduced by added lines, and include a concrete fix and regression test.
+""" % name
+
+
+def _migrate_legacy_artifact(artifact: dict, expected_name: str) -> dict:
+    name = str(artifact.get("name", expected_name)).strip().lower()
+    description = str(artifact.get("description") or (
+        "Apply migrated project-specific guidance during code review."
+    )).replace("\n", " ").strip()
+    lines = [
+        "---", "name: %s" % name,
+        "description: %s" % json.dumps(description, ensure_ascii=False), "---", "",
+        "# Migrated review guidance", "",
+        "Apply these checks to added production lines and verify repository context.", "",
+    ]
+    for rule in artifact.get("rules") or []:
+        rule_id = str(rule.get("rule_id", "REVIEW")).strip().upper()
+        match = str(rule.get("match", "")).replace("`", "'").strip()
+        if not match:
+            continue
+        lines.extend([
+            "<!-- evoagent:learned:%s:start -->" % rule_id,
+            "## %s" % rule_id, "",
+            "Inspect added behavior equivalent to `%s`." % match,
+            "Report `%s` at `%s` severity only when context confirms the defect."
+            % (rule_id, str(rule.get("severity", "medium"))),
+            "Cite the changed line, explain impact, propose a fix, and require a test.",
+            "<!-- evoagent:learned:%s:end -->" % rule_id, "",
+        ])
+    return {"name": name, "files": {"SKILL.md": "\n".join(lines).strip() + "\n"}}
+
+
+def validate_artifact(artifact: Any, expected_name: str = "") -> dict:
+    """Validate and canonicalize one versioned Agent Skill package."""
+    expected_name = str(expected_name).strip().lower()
+    if expected_name and not SKILL_NAME.fullmatch(expected_name):
+        raise ValueError("invalid Agent Skill name")
+    if isinstance(artifact, str):
+        artifact = {"name": expected_name, "files": {"SKILL.md": artifact}}
     if not isinstance(artifact, dict):
-        raise ValueError("skill artifact must be an object")
+        raise ValueError("agent skill artifact must be an object")
+    if "rules" in artifact and "files" not in artifact and "skill_md" not in artifact:
+        artifact = _migrate_legacy_artifact(artifact, expected_name)
+    if "skill_md" in artifact and "files" not in artifact:
+        artifact = {
+            **artifact,
+            "files": {
+                "SKILL.md": artifact.get("skill_md"),
+                **dict(artifact.get("supporting_files") or {}),
+            },
+        }
     name = str(artifact.get("name", expected_name)).strip().lower()
     if expected_name and name != expected_name:
-        raise ValueError("skill artifact name must match skill_name")
-    if not SKILL_NAME.fullmatch(name):
-        raise ValueError("evolved skill names must start with 'evolved-'")
-    raw_rules = artifact.get("rules", [])
-    if not isinstance(raw_rules, list) or len(raw_rules) > 100:
-        raise ValueError("skill artifact rules must be a list with at most 100 items")
-
-    rules = []
-    identities = set()
-    for raw in raw_rules:
-        if not isinstance(raw, dict):
-            raise ValueError("each evolved skill rule must be an object")
-        rule_id = str(raw.get("rule_id", "")).strip().upper()
-        if not RULE_ID.fullmatch(rule_id):
-            raise ValueError("invalid evolved skill rule_id: %s" % rule_id)
-        try:
-            severity = Severity(str(raw.get("severity", "medium")).lower()).value
-        except ValueError as exc:
-            raise ValueError("invalid severity for rule %s" % rule_id) from exc
-        match = str(raw.get("match", "")).strip()
-        if not match or len(match) > 240 or "\n" in match or "\r" in match:
-            raise ValueError("rule %s match must be a single non-empty line" % rule_id)
-        identity = (rule_id, match, bool(raw.get("ignore_case", False)))
-        if identity in identities:
-            raise ValueError("duplicate evolved skill rule: %s" % rule_id)
-        identities.add(identity)
-        confidence = float(raw.get("confidence", .85))
-        if not 0.0 <= confidence <= 1.0:
-            raise ValueError("rule confidence must be between 0 and 1")
-        include_paths = raw.get("include_paths", [])
-        exclude_paths = raw.get("exclude_paths", ["tests/"])
-        if not isinstance(include_paths, list) or not isinstance(exclude_paths, list):
-            raise ValueError("rule path filters must be lists")
-        if any(not isinstance(item, str) or len(item) > 200 for item in include_paths + exclude_paths):
-            raise ValueError("invalid rule path filter")
-        rules.append({
-            "rule_id": rule_id,
-            "severity": severity,
-            "match": match,
-            "ignore_case": bool(raw.get("ignore_case", False)),
-            "include_paths": include_paths,
-            "exclude_paths": exclude_paths,
-            "title": str(raw.get("title") or ("Confirmed %s finding" % rule_id))[:200],
-            "explanation": str(raw.get("explanation") or "A confirmed feedback pattern was found on an added line.")[:2000],
-            "fix": str(raw.get("fix") or "Replace the unsafe construct with a constrained alternative.")[:2000],
-            "test": str(raw.get("test") or "Add a regression test covering the confirmed failure mode.")[:2000],
-            "confidence": round(confidence, 4),
-        })
-    rules.sort(key=lambda item: (item["rule_id"], item["match"]))
-    return {
-        "schema_version": ARTIFACT_SCHEMA_VERSION,
-        "name": name,
-        "description": str(artifact.get("description") or "Replay-gated rules learned from confirmed review feedback")[:500],
-        "permissions": [],
-        "rules": rules,
-    }
+        raise ValueError("agent skill artifact name must match skill_name")
+    skill = AgentSkill.from_artifact({
+        "name": name, "files": dict(artifact.get("files") or {}),
+    })
+    normalized = skill.to_artifact()
+    normalized["schema_version"] = ARTIFACT_SCHEMA_VERSION
+    return normalized
 
 
-class DeclarativeSkillReviewer(Reviewer):
-    """Execute a validated evolved artifact without eval, imports or subprocesses."""
+class _ReplayTaskStore:
+    def __init__(self, skill_name: str):
+        self.skill_name = skill_name
 
-    def __init__(self, artifact: dict, version: Optional[int] = None):
-        self.artifact = validate_artifact(artifact, str(artifact.get("name", "")))
-        self.version = version
-        self.name = self.artifact["name"] + ("@%s" % version if version is not None else "")
+    def get(self, _task_id: str, _tenant_id: Optional[str] = None) -> dict:
+        return {"input": {
+            "mode": "agentic",
+            "enabled_agents": ["lead", "security", "correctness-reliability", "critic"],
+            "enabled_skills": [self.skill_name],
+        }}
 
-    def review(self, diff: str, parsed) -> List[Finding]:
-        findings = []
-        seen = set()
-        for line in parsed.added_lines:
-            for rule in self.artifact["rules"]:
-                if rule["include_paths"] and not any(line.path.startswith(p) for p in rule["include_paths"]):
-                    continue
-                if any(line.path.startswith(p) for p in rule["exclude_paths"]):
-                    continue
-                content = line.content.lower() if rule["ignore_case"] else line.content
-                needle = rule["match"].lower() if rule["ignore_case"] else rule["match"]
-                key = (rule["rule_id"], line.path, line.line)
-                if needle not in content or key in seen:
-                    continue
-                seen.add(key)
-                findings.append(Finding(
-                    rule_id=rule["rule_id"], severity=Severity(rule["severity"]),
-                    title=rule["title"], explanation=rule["explanation"],
-                    path=line.path, line=line.line, evidence=line.content.strip()[:240],
-                    fix=rule["fix"], test=rule["test"], confidence=rule["confidence"],
-                ))
-        return findings
+
+class AgentSkillReplayReviewer(Reviewer):
+    """Replay a candidate through the product Lead/worker Skill runtime."""
+
+    def __init__(self, artifact: dict, client, token_budget: int = 8000, time_budget_seconds: int = 60):
+        from .agentic_core import AgenticReviewer
+
+        self.skill = AgentSkill.from_artifact(artifact)
+        self.name = "%s-agent-skill-replay" % self.skill.name
+        self._sequence = 0
+        self._last_task_id = ""
+        self.token_budget = int(token_budget)
+        self.time_budget_seconds = int(time_budget_seconds)
+        self.agentic = AgenticReviewer(
+            _ReplayTaskStore(self.skill.name), client,
+            default_token_budget=token_budget,
+            default_time_budget=time_budget_seconds,
+            skill_provider=lambda _tenant: [self.skill],
+        )
+
+    def review(self, diff: str, parsed) -> list:
+        return self.review_case({"diff": diff, "repository": ""}, parsed)
+
+    def review_case(self, case: dict, parsed) -> list:
+        self._sequence += 1
+        self._last_task_id = "skill-replay:%s:%d" % (self.skill.name, self._sequence)
+        return self.agentic.review_with_context(
+            self._last_task_id, case["diff"], parsed,
+            repository=str(case.get("repository_root") or case.get("repository") or ""),
+        )
+
+    def evaluation_execution(self) -> dict:
+        return dict(
+            self.agentic.collaboration_summary(self._last_task_id).get("execution") or {}
+        )
+
+    def evaluation_collaboration(self) -> dict:
+        return dict(
+            self.agentic.collaboration_summary(self._last_task_id).get("collaboration") or {}
+        )
+
+    def evaluation_config(self) -> dict:
+        return {
+            "mode": "agentic", "roles": [
+                "lead", "security", "correctness-reliability", "critic",
+            ],
+            "skill": self.skill.name,
+            "per_role_token_budget": self.token_budget,
+            "per_role_time_budget_seconds": self.time_budget_seconds,
+        }
 
 
 class SkillEvolutionEngine:
-    """Create, replay, activate and roll back declarative skill versions."""
+    """Create, replay, activate and roll back Agent Skill package versions."""
 
     def __init__(
         self, store, reviewer_factory: Optional[Callable[[dict], Reviewer]] = None,
@@ -136,7 +167,7 @@ class SkillEvolutionEngine:
         min_holdout_cases: int = 2, max_metric_regression: float = 0.0,
     ):
         self.store = store
-        self.reviewer_factory = reviewer_factory or (lambda artifact: DeclarativeSkillReviewer(artifact))
+        self.reviewer_factory = reviewer_factory
         self.min_cases = min_cases
         self.max_cases = max_cases
         self.min_improvement = min_improvement
@@ -146,82 +177,139 @@ class SkillEvolutionEngine:
 
     @staticmethod
     def empty_artifact(skill_name: str) -> dict:
-        return validate_artifact({"name": skill_name, "rules": []}, skill_name)
+        return validate_artifact(_default_skill_markdown(skill_name), skill_name)
+
+    @classmethod
+    def build_candidate_artifact(
+        cls, skill_name: str, base_artifact: dict, feedback: list,
+    ) -> dict:
+        """Pure artifact mutation used by controlled and production experiments.
+
+        Feedback must already contain concrete evidence; no task-store lookup is
+        performed here. This keeps experiment arms isolated and reproducible.
+        """
+        artifact = validate_artifact(base_artifact, skill_name)
+        content = artifact["files"]["SKILL.md"]
+        learned, removed, used = [], [], []
+        for index, case in enumerate(feedback):
+            finding = (case.get("payload") or {}).get("finding") or {}
+            rule_id = str(finding.get("rule_id", "")).strip().upper()
+            if not RULE_ID.fullmatch(rule_id):
+                continue
+            category = str(case.get("category", ""))
+            if category == "false_positive":
+                updated = cls._remove_learned_block(content, rule_id)
+                if updated != content:
+                    content = updated
+                    removed.append(rule_id)
+                    used.append(case.get("id", index))
+                continue
+            if category != "missed_issue":
+                continue
+            evidence = str(finding.get("evidence", "")).strip()
+            if not evidence or len(evidence) > 240 or "\n" in evidence or "\r" in evidence:
+                continue
+            if "evoagent:learned:%s:start" % rule_id in content:
+                continue
+            content = content.rstrip() + "\n\n" + cls._learned_block(
+                rule_id, finding, evidence,
+            )
+            learned.append(rule_id)
+            used.append(case.get("id", index))
+        candidate = validate_artifact({
+            "name": skill_name,
+            "files": {**artifact["files"], "SKILL.md": content},
+        }, skill_name)
+        return {
+            "artifact": candidate,
+            "learned_rule_ids": sorted(set(learned)),
+            "removed_rule_ids": sorted(set(removed)),
+            "used_feedback_ids": used,
+        }
 
     def _factory(self, serialized: str) -> Reviewer:
+        if self.reviewer_factory is None:
+            raise RuntimeError("Agent Skill replay requires a configured model")
         return self.reviewer_factory(json.loads(serialized))
 
     @staticmethod
-    def _redact_holdout(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    def _redact_holdout(metrics: dict) -> dict:
         return {key: value for key, value in metrics.items() if key not in {"case_results", "errors"}}
 
-    def _non_regressing(self, candidate: dict, baseline: dict) -> bool:
+    def metrics_non_regressing(self, candidate: dict, baseline: dict) -> bool:
         protected = ["score", "precision", "recall", "high_severity_recall", "success_rate"]
         if baseline.get("positive_cases", 0):
             protected.append("severity_accuracy")
         if baseline.get("clean_cases", 0):
             protected.append("clean_accuracy")
         return all(
-            float(candidate.get(name, 0)) + self.max_metric_regression
-            >= float(baseline.get(name, 0)) for name in protected
+            float(candidate.get(key, 0)) + self.max_metric_regression
+            >= float(baseline.get(key, 0)) for key in protected
         )
 
-    def status(
-        self, skill_name: str = "evolved-review", tenant_id: str = "default",
-    ) -> Dict[str, Any]:
+    def _non_regressing(self, candidate: dict, baseline: dict) -> bool:
+        return self.metrics_non_regressing(candidate, baseline)
+
+    def status(self, skill_name: str = "evolved-review", tenant_id: str = "default") -> dict:
         validation = self.store.list_evaluation_cases("validation", True, self.max_cases)
         holdout = self.store.list_evaluation_cases("holdout", True, self.max_cases)
         active = self.store.get_active_skill_artifact(skill_name, tenant_id)
         return {
-            "tenant_id": tenant_id, "skill_name": skill_name,
+            "tenant_id": tenant_id, "skill_name": skill_name, "format": "agent-skill",
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             "active_version": active.get("version") if active else None,
             "active_artifact_sha256": active.get("artifact_sha256") if active else None,
             "validation_cases": len(validation), "holdout_cases": len(holdout),
             "minimum_cases": self.min_cases, "minimum_holdout_cases": self.min_holdout_cases,
             "minimum_improvement": self.min_improvement,
             "maximum_metric_regression": self.max_metric_regression,
-            "ready": len(validation) >= self.min_cases and len(holdout) >= self.min_holdout_cases,
+            "model_configured": self.reviewer_factory is not None,
+            "ready": self.reviewer_factory is not None
+            and len(validation) >= self.min_cases and len(holdout) >= self.min_holdout_cases,
         }
 
-    def propose(
-        self, skill_name: str, artifact: dict, tenant_id: str = "default",
-    ) -> Dict[str, Any]:
+    def propose(self, skill_name: str, artifact: Any, tenant_id: str = "default") -> dict:
         skill_name = skill_name.strip().lower()
-        candidate_artifact = validate_artifact(artifact, skill_name)
+        candidate = validate_artifact(artifact, skill_name)
         with self._lock:
-            return self._propose(skill_name, candidate_artifact, tenant_id)
+            return self._propose(skill_name, candidate, tenant_id)
 
-    def _propose(self, skill_name: str, artifact: dict, tenant_id: str) -> Dict[str, Any]:
+    def _propose(self, skill_name: str, artifact: dict, tenant_id: str) -> dict:
         active = self.store.get_active_skill_artifact(skill_name, tenant_id)
-        if active and active["artifact_sha256"] == _sha256(artifact):
+        baseline_artifact = (
+            validate_artifact(active["artifact"], skill_name)
+            if active else self.empty_artifact(skill_name)
+        )
+        if active and _sha256(baseline_artifact) == _sha256(artifact):
             return {
                 "version": self._public_version(active), "decision": "deferred",
-                "reason": "candidate skill artifact is identical to the active version",
+                "reason": "candidate Agent Skill is identical to the active version",
                 "candidate": {}, "baseline": {}, "candidate_holdout": {},
                 "baseline_holdout": {}, "gates": {}, "run_id": None,
             }
-        baseline_artifact = active["artifact"] if active else self.empty_artifact(skill_name)
         validation = self.store.list_evaluation_cases("validation", True, self.max_cases)
         holdout = self.store.list_evaluation_cases("holdout", True, self.max_cases)
-        decision = "deferred"
-        reason = ""
+        baseline_metrics = self._empty_metrics(len(validation))
+        candidate_metrics = self._empty_metrics(len(validation))
+        baseline_holdout = self._empty_metrics(len(holdout))
+        candidate_holdout = self._empty_metrics(len(holdout))
+        decision, reason = "deferred", ""
         gates = {
-            "artifact_valid": True,
+            "artifact_valid": True, "runtime_is_agent_skill": True,
+            "model_configured": self.reviewer_factory is not None,
             "validation_dataset_ready": len(validation) >= self.min_cases,
             "holdout_dataset_ready": len(holdout) >= self.min_holdout_cases,
             "evaluation_success": None, "validation_improvement": None,
             "validation_non_regression": None, "holdout_non_regression": None,
         }
-        evaluator = RegressionEvaluator(self._factory)
-        baseline_metrics = self._empty_metrics(len(validation))
-        candidate_metrics = self._empty_metrics(len(validation))
-        baseline_holdout = self._empty_metrics(len(holdout))
-        candidate_holdout = self._empty_metrics(len(holdout))
-        if len(validation) < self.min_cases:
+        if self.reviewer_factory is None:
+            reason = "candidate saved but no model-backed Agent Skill replay is configured"
+        elif len(validation) < self.min_cases:
             reason = "candidate saved but the validation dataset is smaller than the activation minimum"
         elif len(holdout) < self.min_holdout_cases:
             reason = "candidate saved but the holdout dataset is smaller than the activation minimum"
         else:
+            evaluator = RegressionEvaluator(self._factory)
             baseline_metrics = evaluator.run(_canonical_json(baseline_artifact), validation)
             candidate_metrics = evaluator.run(_canonical_json(artifact), validation)
             baseline_holdout = evaluator.run(_canonical_json(baseline_artifact), holdout)
@@ -240,7 +328,7 @@ class SkillEvolutionEngine:
             })
             if no_errors and improved and validation_safe and holdout_safe:
                 decision = "activated"
-                reason = "candidate skill improved validation and passed holdout non-regression"
+                reason = "candidate SKILL.md improved validation and passed holdout non-regression"
             else:
                 decision = "rejected"
                 failures = []
@@ -253,28 +341,29 @@ class SkillEvolutionEngine:
                 if not holdout_safe:
                     failures.append("a protected holdout metric regressed")
                 reason = "; ".join(failures)
-
         version = self.store.save_skill_artifact(
             skill_name, artifact, candidate_metrics.get("score", 0.0),
             decision == "activated", tenant_id,
         )
+        candidate_change = self._skill_diff(baseline_artifact, artifact)
         run = {
             "id": str(uuid.uuid4()), "tenant_id": tenant_id, "skill_name": skill_name,
             "candidate_version": version["version"],
             "baseline_version": active.get("version") if active else None,
             "decision": decision, "candidate_score": candidate_metrics.get("score", 0.0),
-            "baseline_score": baseline_metrics.get("score", 0.0),
+            "baseline_score": baseline_metrics.get("score", 0.0), "created_at": utc_now(),
             "metrics": {
                 "candidate": candidate_metrics, "baseline": baseline_metrics,
                 "candidate_holdout": self._redact_holdout(candidate_holdout),
                 "baseline_holdout": self._redact_holdout(baseline_holdout),
-                "gates": gates, "reason": reason,
+                "gates": gates, "reason": reason, "candidate_change": candidate_change,
                 "reproducibility": {
                     "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
                     "candidate_artifact_sha256": version["artifact_sha256"],
-                    "baseline_artifact_sha256": active.get("artifact_sha256") if active else _sha256(baseline_artifact),
+                    "baseline_artifact_sha256": active.get("artifact_sha256")
+                    if active else _sha256(baseline_artifact),
                 },
-            }, "created_at": utc_now(),
+            },
         }
         self.store.save_skill_evolution_run(run)
         return {
@@ -282,30 +371,33 @@ class SkillEvolutionEngine:
             "candidate": candidate_metrics, "baseline": baseline_metrics,
             "candidate_holdout": self._redact_holdout(candidate_holdout),
             "baseline_holdout": self._redact_holdout(baseline_holdout),
-            "gates": gates, "run_id": run["id"],
+            "gates": gates, "run_id": run["id"], "candidate_change": candidate_change,
         }
 
-    def auto_propose(self, skill_name: str = "evolved-review", tenant_id: Optional[str] = None) -> Dict[str, Any]:
+    def auto_propose(
+        self, skill_name: str = "evolved-review", tenant_id: Optional[str] = None,
+    ) -> dict:
         skill_name = skill_name.strip().lower()
         if not SKILL_NAME.fullmatch(skill_name):
-            raise ValueError("evolved skill names must start with 'evolved-'")
+            raise ValueError("invalid Agent Skill name")
         failures = self.store.list_failure_cases(True, 100, tenant_id)
         tenant_id = tenant_id or "default"
         active = self.store.get_active_skill_artifact(skill_name, tenant_id)
-        artifact = dict(active["artifact"]) if active else self.empty_artifact(skill_name)
-        rules = [dict(item) for item in artifact["rules"]]
-        used_ids = []
-        learned = []
-        removed = []
+        artifact = (
+            validate_artifact(active["artifact"], skill_name)
+            if active else self.empty_artifact(skill_name)
+        )
+        content = artifact["files"]["SKILL.md"]
+        used_ids, learned, removed = [], [], []
         for case in failures:
             finding = (case.get("payload") or {}).get("finding") or {}
             rule_id = str(finding.get("rule_id", "")).strip().upper()
             if not RULE_ID.fullmatch(rule_id):
                 continue
             if case.get("category") == "false_positive":
-                before = len(rules)
-                rules = [rule for rule in rules if rule["rule_id"] != rule_id]
-                if len(rules) != before:
+                updated = self._remove_learned_block(content, rule_id)
+                if updated != content:
+                    content = updated
                     removed.append(rule_id)
                     used_ids.append(case["id"])
                 continue
@@ -316,30 +408,22 @@ class SkillEvolutionEngine:
                 evidence = self._evidence_from_task(case["task_id"], finding)
             if not evidence or len(evidence) > 240 or "\n" in evidence or "\r" in evidence:
                 continue
-            raw_rule = {
-                "rule_id": rule_id, "severity": finding.get("severity", "medium"),
-                "match": evidence, "ignore_case": False,
-                "include_paths": [], "exclude_paths": ["tests/"],
-                "title": finding.get("title"), "explanation": finding.get("explanation"),
-                "fix": finding.get("fix"), "test": finding.get("test"),
-                "confidence": finding.get("confidence", .85),
-            }
-            normalized = validate_artifact({"name": skill_name, "rules": [raw_rule]}, skill_name)["rules"][0]
-            if not any(
-                rule["rule_id"] == normalized["rule_id"] and rule["match"] == normalized["match"]
-                for rule in rules
-            ):
-                rules.append(normalized)
-                learned.append(rule_id)
-                used_ids.append(case["id"])
-        candidate = validate_artifact({**artifact, "name": skill_name, "rules": rules}, skill_name)
+            if "evoagent:learned:%s:start" % rule_id in content:
+                continue
+            content = content.rstrip() + "\n\n" + self._learned_block(rule_id, finding, evidence)
+            learned.append(rule_id)
+            used_ids.append(case["id"])
         if not used_ids:
             return {
                 "version": None, "decision": "deferred",
-                "reason": "no supported skill mutation signal was found in unresolved feedback",
+                "reason": "no supported SKILL.md mutation signal was found in unresolved feedback",
                 "failure_cases_used": len(failures), "learned_rule_ids": [],
                 "removed_rule_ids": [], "run_id": None,
             }
+        candidate = validate_artifact({
+            "name": skill_name,
+            "files": {**artifact["files"], "SKILL.md": content},
+        }, skill_name)
         result = self.propose(skill_name, candidate, tenant_id)
         result.update({
             "failure_cases_used": len(used_ids),
@@ -350,13 +434,35 @@ class SkillEvolutionEngine:
             self.store.resolve_failure_cases(used_ids)
         return result
 
+    @staticmethod
+    def _learned_block(rule_id: str, finding: dict, evidence: str) -> str:
+        evidence = evidence.replace("`", "'")
+        severity = str(finding.get("severity", "medium")).lower()
+        return "\n".join([
+            "<!-- evoagent:learned:%s:start -->" % rule_id,
+            "## Confirmed %s guidance" % rule_id, "",
+            "Inspect added behavior equivalent to `%s`." % evidence,
+            "Report `%s` at `%s` severity only when repository context confirms the defect."
+            % (rule_id, severity),
+            "Cite the changed line, explain impact, propose a minimal fix, and require a regression test.",
+            "<!-- evoagent:learned:%s:end -->" % rule_id, "",
+        ])
+
+    @staticmethod
+    def _remove_learned_block(content: str, rule_id: str) -> str:
+        pattern = re.compile(
+            r"\n*<!-- evoagent:learned:%s:start -->.*?"
+            r"<!-- evoagent:learned:%s:end -->\n*" % (re.escape(rule_id), re.escape(rule_id)),
+            re.DOTALL,
+        )
+        return pattern.sub("\n", content).rstrip() + "\n"
+
     def _evidence_from_task(self, task_id: str, finding: dict) -> str:
         diff = self.store.get_task_payload(task_id)
         if not diff:
             return ""
         try:
-            path = str(finding.get("path", ""))
-            line = int(finding.get("line", 0))
+            path, line = str(finding.get("path", "")), int(finding.get("line", 0))
             for changed in parse_unified_diff(diff).added_lines:
                 if changed.path == path and changed.line == line:
                     return changed.content.strip()
@@ -364,10 +470,22 @@ class SkillEvolutionEngine:
             return ""
         return ""
 
-    def rollback(
-        self, skill_name: str, version: int, tenant_id: str = "default",
-    ) -> bool:
+    def rollback(self, skill_name: str, version: int, tenant_id: str = "default") -> bool:
         return self.store.activate_skill_artifact(skill_name, version, tenant_id)
+
+    @staticmethod
+    def _skill_diff(baseline: dict, candidate: dict) -> dict:
+        before, after = baseline.get("files") or {}, candidate.get("files") or {}
+        names = sorted(set(before).union(after))
+        return {
+            "changed_files": [name for name in names if before.get(name) != after.get(name)],
+            "baseline_skill_md_sha256": hashlib.sha256(
+                str(before.get("SKILL.md", "")).encode("utf-8")
+            ).hexdigest(),
+            "candidate_skill_md_sha256": hashlib.sha256(
+                str(after.get("SKILL.md", "")).encode("utf-8")
+            ).hexdigest(),
+        }
 
     @staticmethod
     def _empty_metrics(cases: int) -> Dict[str, Any]:

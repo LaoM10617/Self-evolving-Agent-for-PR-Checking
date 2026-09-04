@@ -2,7 +2,7 @@ import json
 import unittest
 
 from evoagent.diff_parser import parse_unified_diff
-from evoagent.evaluation_benchmark import ContextRuleReviewer
+from evoagent.review_rules import ContextRuleReviewer
 from evoagent.evaluation_v2 import (
     FairAblationSuite,
     ProductArmReviewer,
@@ -29,18 +29,39 @@ class FakeClient:
                 role, self.provider, self.model,
                 {"prompt_tokens": 10, "completion_tokens": 5}, 1,
             )
-        if role == "planner":
-            return {
-                "action": "final",
-                "task_graph": [
-                    {"specialist": "security", "objective": "Review security"},
-                    {
-                        "specialist": "correctness-reliability",
-                        "objective": "Review correctness",
-                    },
-                ],
-            }
-        if role in {"hybrid-reviewer", "security", "correctness-reliability"}:
+        if role == "lead":
+            managed = json.loads(user)
+            task = json.loads(managed["task"])
+            if task["phase"] == "delegate":
+                return {
+                    "action": "final",
+                    "delegations": [
+                        {
+                            "assignment_id": "security-1", "worker": "security",
+                            "objective": "Review security",
+                        },
+                        {
+                            "assignment_id": "reliability-1",
+                            "worker": "correctness-reliability",
+                            "objective": "Review correctness",
+                        },
+                    ],
+                }
+            if task["phase"] == "assess-workers":
+                return {
+                    "action": "final", "revision_requests": [],
+                    "critic_objective": "Blindly verify every candidate.",
+                }
+            if task["phase"] == "finalize":
+                return {
+                    "action": "final",
+                    "accepted_finding_indices": list(
+                        range(len(task["candidate_findings"]))
+                    ),
+                    "confidence_adjustments": [],
+                }
+            raise AssertionError(task["phase"])
+        if role in {"security", "correctness-reliability"}:
             return {"action": "final", "findings": []}
         if role == "critic":
             managed = json.loads(user)
@@ -61,16 +82,15 @@ class FakeClient:
 
 
 class AgenticEvaluationTests(unittest.TestCase):
-    def test_all_arms_share_exactly_fourteen_rules_and_real_role_topologies(self):
+    def test_agentic_arms_share_exactly_fourteen_rules_and_real_role_topologies(self):
         self.assertEqual(14, len(LocalRuleReviewer.RULES) + len(ContextRuleReviewer.RULES))
         expected_calls = {
-            "rules-only": {},
-            "single-llm": {"hybrid-reviewer": 1},
             "multi-llm-no-critic": {
-                "planner": 1, "security": 1, "correctness-reliability": 1,
+                "lead": 2, "security": 1,
+                "correctness-reliability": 1,
             },
             "full-agentic": {
-                "planner": 1, "security": 1,
+                "lead": 2, "security": 1,
                 "correctness-reliability": 1, "critic": 1,
             },
         }
@@ -93,7 +113,7 @@ class AgenticEvaluationTests(unittest.TestCase):
                 "repository": "repo-%d" % index,
                 "pull_request": index,
                 "split": split,
-                "source": {"kind": "synthetic-controlled"},
+                "source": {"kind": "offline-fixture"},
                 "diff": DIFF,
                 "expected_findings": [{
                     "path": "app.py", "start_line": 1, "end_line": 1,
@@ -108,10 +128,12 @@ class AgenticEvaluationTests(unittest.TestCase):
         )
         report = suite.run(cases)
         self.assertFalse(report["dataset"]["ready"])
-        self.assertFalse(report["launch_gate"]["passed"])
         self.assertFalse(report["critic_gate"]["passed"])
         self.assertEqual(
-            {"planner": 3, "security": 3, "correctness-reliability": 3, "critic": 3},
+            {
+                "lead": 6, "security": 3,
+                "correctness-reliability": 3, "critic": 3,
+            },
             report["arms"]["full-agentic"]["execution"]["model_role_calls"],
         )
 

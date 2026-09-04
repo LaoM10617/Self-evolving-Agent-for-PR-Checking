@@ -90,6 +90,26 @@ class ExecutionLedger:
             item["sequence"] = len(values) + 1
             values.append(item)
 
+    def restore(self, summary: Dict[str, Any]) -> None:
+        """Restore a checkpointed ledger before resuming an agentic session."""
+        models = [
+            ModelCall(**item) for item in summary.get("model_call_log") or []
+            if isinstance(item, dict)
+        ]
+        tools = [
+            ToolCall(**item) for item in summary.get("tool_call_log") or []
+            if isinstance(item, dict)
+        ]
+        traces = {
+            str(role): [dict(item) for item in values if isinstance(item, dict)]
+            for role, values in (summary.get("agent_traces") or {}).items()
+            if isinstance(values, list)
+        }
+        with self._lock:
+            self.model_calls = models
+            self.tool_calls = tools
+            self.agent_traces = traces
+
     def summary(self, include_trace: bool = True) -> Dict[str, Any]:
         with self._lock:
             models = [asdict(item) for item in self.model_calls]
