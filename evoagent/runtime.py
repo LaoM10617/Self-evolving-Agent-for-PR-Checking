@@ -10,6 +10,7 @@ framework-owned checkpoint format.
 """
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+import json
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -24,6 +25,11 @@ class RuntimeCancelled(RuntimeError):
 
 class ToolProtocolError(RuntimeError):
     """A tool request does not match the registered tool contract."""
+
+
+# Backward-compatible name retained for the legacy MultiAgentCoordinator.
+# New tool-registry callers should use ToolProtocolError directly.
+AgentLoopProtocolError = ToolProtocolError
 
 
 @dataclass(frozen=True)
@@ -217,3 +223,99 @@ class AgentRuntime:
             if last_error is not None:
                 raise last_error
         return state
+
+
+@dataclass
+class AgentLoopResult:
+    """Result returned by the legacy bounded model/tool loop."""
+
+    output: Any
+    steps: int
+    observations: List[Dict[str, Any]]
+    stop_reason: str
+
+
+class AgentLoop:
+    """Backward-compatible bounded loop used by MultiAgentCoordinator.
+
+    The active agentic reviewer uses ``agentic_core.BoundedRole``. Keeping this
+    small adapter isolates the legacy coordinator without changing the current
+    production review path.
+    """
+
+    def __init__(
+        self, max_steps: int = 4, timeout_seconds: int = 45,
+        max_observation_chars: int = 4000,
+    ):
+        if max_steps < 1:
+            raise ValueError("agent loop max_steps must be at least 1")
+        if timeout_seconds < 1:
+            raise ValueError("agent loop timeout_seconds must be at least 1")
+        self.max_steps = max_steps
+        self.timeout_seconds = timeout_seconds
+        self.max_observation_chars = max(256, max_observation_chars)
+
+    def run(
+        self, stepper: Callable[[Dict[str, Any]], Dict[str, Any]],
+        tools: Any, initial_state: Dict[str, Any],
+        event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> AgentLoopResult:
+        state = dict(initial_state)
+        observations = list(state.get("observations") or [])
+        started = time.monotonic()
+
+        def emit(kind: str, **detail) -> None:
+            if event_sink:
+                event_sink(kind, detail)
+
+        for step in range(1, self.max_steps + 1):
+            if time.monotonic() - started > self.timeout_seconds:
+                emit("agent_loop_budget_exhausted", step=step, budget="time")
+                raise RuntimeBudgetExceeded("agent loop time budget exceeded")
+            state["loop_step"] = step
+            state["observations"] = list(observations)
+            action = stepper(state)
+            if not isinstance(action, dict):
+                raise AgentLoopProtocolError("agent loop action must be an object")
+            kind = str(action.get("action", "")).strip().lower()
+            emit("agent_loop_action", step=step, action=kind)
+            if kind == "final":
+                return AgentLoopResult(
+                    action.get("findings", action.get("output")), step,
+                    observations, "final",
+                )
+            if kind != "tool":
+                raise AgentLoopProtocolError(
+                    "unsupported agent loop action: %s" % kind
+                )
+            tool_name = str(action.get("tool", "")).strip()
+            arguments = action.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                raise AgentLoopProtocolError("tool arguments must be an object")
+            try:
+                if isinstance(tools, ToolRegistry):
+                    value = tools.invoke(tool_name, arguments)
+                else:
+                    tool = tools.get(tool_name)
+                    if tool is None:
+                        raise AgentLoopProtocolError(
+                            "unknown agent tool: %s" % tool_name
+                        )
+                    value = tool(**arguments)
+                rendered = (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    if isinstance(value, (dict, list, tuple)) else str(value)
+                )
+                observation = {
+                    "step": step, "tool": tool_name, "ok": True,
+                    "result": rendered[:self.max_observation_chars],
+                }
+            except Exception as exc:
+                observation = {
+                    "step": step, "tool": tool_name, "ok": False,
+                    "error": str(exc)[:1000],
+                }
+            observations.append(observation)
+            emit("agent_loop_observation", **observation)
+        emit("agent_loop_budget_exhausted", step=self.max_steps, budget="steps")
+        raise RuntimeBudgetExceeded("agent loop step budget exceeded")
