@@ -1,3 +1,4 @@
+import ast
 import os
 import tempfile
 import time
@@ -37,8 +38,22 @@ class AdvancedFeatureTests(unittest.TestCase):
             {"path": "app.py", "line": 3, "rule_id": "REL-DEBUG-PRINT"},
         ]
         result = SafeFixer().apply(content, findings, "app.py")
-        self.assertIn("import os", result["content"])
-        self.assertIn('password = os.environ["PASSWORD"]', result["content"])
+        tree = ast.parse(result["content"])
+        password_assignment = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "password"
+        )
+        replacement = password_assignment.value
+        self.assertIsInstance(replacement, ast.Subscript)
+        self.assertIsInstance(replacement.value, ast.Attribute)
+        self.assertEqual("environ", replacement.value.attr)
+        self.assertIsInstance(replacement.value.value, ast.Name)
+        self.assertEqual("os", replacement.value.value.id)
+        self.assertIsInstance(replacement.slice, ast.Constant)
+        self.assertEqual("PASSWORD", replacement.slice.value)
         self.assertIn("eval(user_input)", result["content"])
         self.assertNotIn("print(result)", result["content"])
         self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
